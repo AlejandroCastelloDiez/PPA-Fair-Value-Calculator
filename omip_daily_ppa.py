@@ -450,7 +450,7 @@ def plot_basis(df: pd.DataFrame, out_path: Path) -> None:
             continue
         ax.plot(series.index, series.values, label=label, linewidth=2.2, color=LINE_COLORS.get(label))
 
-    ax.set_title("PPA Premium (Portugal - Spain) by Tenor", loc="left")
+    ax.set_title("Portugal PPA Premium by Tenor", loc="left")
     ax.set_xlabel("")
     ax.set_ylabel("€/MWh")
     ax.grid(False)
@@ -480,8 +480,8 @@ def main() -> None:
     if df.empty:
         raise RuntimeError("Store has no data after update; cannot plot.")
 
-    plot_zone(df, "ES", IMG_ES, "PPA FV — Spain (ES) by Tenor")
-    plot_zone(df, "PT", IMG_PT, "PPA FV — Portugal (PT) by Tenor")
+    plot_zone(df, "ES", IMG_ES, "Spain PPA Fair Value by Tenor")
+    plot_zone(df, "PT", IMG_PT, "Portugal PPA Fair Value by Tenor")
     plot_basis(df, IMG_BASIS)
 
     print(f"Updated: {PPA_JSON_PATH.name} (date added if missing: {yyyymmdd_to_iso(yyyymmdd)})")
