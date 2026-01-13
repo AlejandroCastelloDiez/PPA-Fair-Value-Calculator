@@ -146,8 +146,10 @@ def fetch_omip_year_reference_prices(
     Returns mapping delivery_year -> D reference price (€/MWh) for Year contracts
     (e.g., YR-27 -> 2027) for the given market and date.
 
-    Scrapes https://www.omip.pt/es/dados-mercado?date=YYYY-MM-DD&instrument=...&product=EL&zone=...
-    and parses table "Reference prices" (column 'D (€/MWh)').
+    Robust to OMIP multi-row grouped headers by:
+      - picking the table that actually contains YR-xx rows
+      - using the last non-empty THEAD row as the effective header
+      - locating column 'D' while excluding 'D-1', 'D-2', ...
     """
     sess = session or requests.Session()
     params = {
@@ -161,64 +163,106 @@ def fetch_omip_year_reference_prices(
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # Find the table that contains the header "Contract name" and "D (€/MWh)"
     tables = soup.find_all("table")
-    target = None
+    if not tables:
+        raise RuntimeError("No tables found in OMIP HTML.")
+
+    # -----------------------------
+    # 1) Pick the table that contains Year rows (YR-xx)
+    # -----------------------------
+    def count_year_rows(tbl) -> int:
+        cnt = 0
+        for tr in tbl.find_all("tr"):
+            txt = tr.get_text(" ", strip=True)
+            if re.search(r"\bYR-(\d{2})\b", txt):
+                cnt += 1
+        return cnt
+
+    scored = [(count_year_rows(t), t) for t in tables]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    year_rows, target = scored[0]
+
+    if year_rows == 0:
+        # As a fallback, keep your previous behavior but with improved header handling.
+        target = max(tables, key=lambda x: len(x.find_all("tr")))
+
+    # -----------------------------
+    # 2) Extract the effective header row (last non-empty THEAD row)
+    # -----------------------------
     header_cells: List[str] = []
-    for t in tables:
-        thead = t.find("thead")
-        if not thead:
-            continue
-        ths = [th.get_text(" ", strip=True) for th in thead.find_all("th")]
-        if any("Contract name" in h for h in ths) and any(re.search(r"\bD\b", h) for h in ths):
-            target = t
-            header_cells = ths
-            break
+    thead = target.find("thead")
+    if thead:
+        head_rows = thead.find_all("tr")
+        # take last non-empty header row
+        for tr in reversed(head_rows):
+            ths = [th.get_text(" ", strip=True) for th in tr.find_all("th")]
+            ths = [h for h in ths if h]  # remove empties
+            if ths:
+                header_cells = ths
+                break
 
-    if target is None:
-        # As a fallback, try the first table with many rows
-        if tables:
-            target = max(tables, key=lambda x: len(x.find_all("tr")))
-            header_cells = [th.get_text(" ", strip=True) for th in target.find_all("th")]
+        # If still empty, fall back to any th in thead
+        if not header_cells:
+            header_cells = [th.get_text(" ", strip=True) for th in thead.find_all("th")]
 
-    if target is None:
-        raise RuntimeError("Could not locate OMIP reference prices table in HTML.")
+    # If no thead or it’s weird, try first row’s th/td as headers
+    if not header_cells:
+        first_tr = target.find("tr")
+        if first_tr:
+            header_cells = [c.get_text(" ", strip=True) for c in first_tr.find_all(["th", "td"])]
 
-    # Identify column indexes
-    # Typical headers include: "Contract name", ... , "D (€/MWh)", "D-1 (€/MWh)" ...
+    if not header_cells:
+        raise RuntimeError("Could not extract header row from OMIP table.")
+
+    # -----------------------------
+    # 3) Identify needed columns
+    # -----------------------------
     def find_col(pattern: str) -> Optional[int]:
         for i, h in enumerate(header_cells):
             if re.search(pattern, h, flags=re.IGNORECASE):
                 return i
         return None
 
-    col_contract = find_col(r"Contract\s*name") or 0
-    col_d = find_col(r"^D\b")  # header like "D (€/MWh)"
+    # Contract name can vary by language; keep it flexible
+    col_contract = (
+        find_col(r"Contract\s*name")
+        or find_col(r"Nombre\s+del\s+contrato")
+        or find_col(r"Nome\s+do\s+contrato")
+        or 0
+    )
+
+    # Match D but NOT D-1 / D-2... (negative lookahead)
+    col_d = find_col(r"^D(?!-)\b")  # header like "D" or "D (€/MWh)"
     if col_d is None:
-        # try contains "D (€/MWh)"
-        col_d = find_col(r"\bD\s*\(")
+        col_d = find_col(r"^D(?!-)\s*\(")  # "D (€/MWh)"
 
     if col_d is None:
-        raise RuntimeError(f"Could not find 'D (€/MWh)' column. Headers: {header_cells}")
+        # Sometimes header text contains units elsewhere; try a looser match but still exclude D-1
+        col_d = find_col(r"\bD(?!-)\b")
 
+    if col_d is None:
+        raise RuntimeError(f"Could not find 'D' column. Headers: {header_cells}")
+
+    # -----------------------------
+    # 4) Parse rows
+    # -----------------------------
     out: Dict[int, float] = {}
-
     tbody = target.find("tbody") or target
     rows = tbody.find_all("tr")
+
     for tr in rows:
         tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
-        if not tds or len(tds) <= max(col_contract, col_d):
+        if not tds:
+            continue
+        if len(tds) <= max(col_contract, col_d):
             continue
 
         contract = tds[col_contract]
-        # We only want Year contracts like "FTB YR-27" / "FPB YR-28"
         m = re.search(r"\bYR-(\d{2})\b", contract)
         if not m:
             continue
 
         yy = int(m.group(1))
-        # interpret YY as 2000+YY (safe for OMIP)
         delivery_year = 2000 + yy
 
         d_val = _safe_float(tds[col_d])
