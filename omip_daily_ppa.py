@@ -146,10 +146,12 @@ def fetch_omip_year_reference_prices(
     Returns mapping delivery_year -> D reference price (€/MWh) for Year contracts
     (e.g., YR-27 -> 2027) for the given market and date.
 
-    Robust to OMIP multi-row grouped headers by:
-      - picking the table that actually contains YR-xx rows
-      - using the last non-empty THEAD row as the effective header
-      - locating column 'D' while excluding 'D-1', 'D-2', ...
+    Robust strategy:
+      - Pick the table that actually contains YR-xx rows
+      - Use the first THEAD row "group headers" + colspans to locate the
+        'Reference prices' group column range
+      - Use the first column inside 'Reference prices' group as 'D' (not D-1, etc.)
+      - Find contract name by locating the cell that contains YR-xx in each row
     """
     sess = session or requests.Session()
     params = {
@@ -168,104 +170,119 @@ def fetch_omip_year_reference_prices(
         raise RuntimeError("No tables found in OMIP HTML.")
 
     # -----------------------------
-    # 1) Pick the table that contains Year rows (YR-xx)
+    # 1) Choose the table that contains YR-xx rows
     # -----------------------------
-    def count_year_rows(tbl) -> int:
+    def year_row_count(tbl) -> int:
         cnt = 0
         for tr in tbl.find_all("tr"):
-            txt = tr.get_text(" ", strip=True)
-            if re.search(r"\bYR-(\d{2})\b", txt):
+            if re.search(r"\bYR-(\d{2})\b", tr.get_text(" ", strip=True)):
                 cnt += 1
         return cnt
 
-    scored = [(count_year_rows(t), t) for t in tables]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    year_rows, target = scored[0]
+    tables_scored = [(year_row_count(t), t) for t in tables]
+    tables_scored.sort(key=lambda x: x[0], reverse=True)
+    best_cnt, target = tables_scored[0]
 
-    if year_rows == 0:
-        # As a fallback, keep your previous behavior but with improved header handling.
-        target = max(tables, key=lambda x: len(x.find_all("tr")))
+    if best_cnt == 0:
+        raise RuntimeError(
+            f"No Year (YR-xx) rows found for {market.zone}/{market.instrument} on {asof_iso_date}. "
+            "OMIP may not have published data for that date."
+        )
 
     # -----------------------------
-    # 2) Extract the effective header row (last non-empty THEAD row)
+    # 2) Locate the 'Reference prices' group range using THEAD colspans
     # -----------------------------
-    header_cells: List[str] = []
     thead = target.find("thead")
-    if thead:
-        head_rows = thead.find_all("tr")
-        # take last non-empty header row
-        for tr in reversed(head_rows):
-            ths = [th.get_text(" ", strip=True) for th in tr.find_all("th")]
-            ths = [h for h in ths if h]  # remove empties
-            if ths:
-                header_cells = ths
+    if not thead:
+        raise RuntimeError("OMIP table has no <thead>; cannot locate Reference prices group.")
+
+    head_rows = thead.find_all("tr")
+    if not head_rows:
+        raise RuntimeError("OMIP table <thead> has no rows.")
+
+    # The group header row is usually the FIRST header row
+    group_row = head_rows[0]
+    group_ths = group_row.find_all("th")
+    if not group_ths:
+        raise RuntimeError("OMIP table group header row has no <th> cells.")
+
+    # Build group segments with start/end indices based on colspan
+    segments = []
+    col_idx = 0
+    for th in group_ths:
+        label = th.get_text(" ", strip=True)
+        colspan = th.get("colspan")
+        try:
+            span = int(colspan) if colspan else 1
+        except Exception:
+            span = 1
+        start = col_idx
+        end = col_idx + span - 1
+        segments.append((label, start, end))
+        col_idx += span
+
+    # Find the segment that corresponds to "Reference prices"
+    ref_seg = None
+    for label, start, end in segments:
+        if re.search(r"Reference\s*prices", label, flags=re.IGNORECASE):
+            ref_seg = (start, end)
+            break
+
+    if ref_seg is None:
+        # Sometimes translated; try Spanish/Portuguese variants
+        for label, start, end in segments:
+            if re.search(r"Precios\s+de\s+referencia", label, flags=re.IGNORECASE) or re.search(
+                r"Preços\s+de\s+referência", label, flags=re.IGNORECASE
+            ):
+                ref_seg = (start, end)
                 break
 
-        # If still empty, fall back to any th in thead
-        if not header_cells:
-            header_cells = [th.get_text(" ", strip=True) for th in thead.find_all("th")]
+    if ref_seg is None:
+        raise RuntimeError(
+            f"Could not locate 'Reference prices' group in headers. Group headers: {[s[0] for s in segments]}"
+        )
 
-    # If no thead or it’s weird, try first row’s th/td as headers
-    if not header_cells:
-        first_tr = target.find("tr")
-        if first_tr:
-            header_cells = [c.get_text(" ", strip=True) for c in first_tr.find_all(["th", "td"])]
+    ref_start, ref_end = ref_seg
 
-    if not header_cells:
-        raise RuntimeError("Could not extract header row from OMIP table.")
+    # Convention on OMIP layout: first column within "Reference prices" group = D
+    col_d = ref_start
 
     # -----------------------------
-    # 3) Identify needed columns
-    # -----------------------------
-    def find_col(pattern: str) -> Optional[int]:
-        for i, h in enumerate(header_cells):
-            if re.search(pattern, h, flags=re.IGNORECASE):
-                return i
-        return None
-
-    # Contract name can vary by language; keep it flexible
-    col_contract = (
-        find_col(r"Contract\s*name")
-        or find_col(r"Nombre\s+del\s+contrato")
-        or find_col(r"Nome\s+do\s+contrato")
-        or 0
-    )
-
-    # Match D but NOT D-1 / D-2... (negative lookahead)
-    col_d = find_col(r"^D(?!-)\b")  # header like "D" or "D (€/MWh)"
-    if col_d is None:
-        col_d = find_col(r"^D(?!-)\s*\(")  # "D (€/MWh)"
-
-    if col_d is None:
-        # Sometimes header text contains units elsewhere; try a looser match but still exclude D-1
-        col_d = find_col(r"\bD(?!-)\b")
-
-    if col_d is None:
-        raise RuntimeError(f"Could not find 'D' column. Headers: {header_cells}")
-
-    # -----------------------------
-    # 4) Parse rows
+    # 3) Parse rows
     # -----------------------------
     out: Dict[int, float] = {}
     tbody = target.find("tbody") or target
     rows = tbody.find_all("tr")
 
     for tr in rows:
-        tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
-        if not tds:
-            continue
-        if len(tds) <= max(col_contract, col_d):
+        cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
+        if not cells:
             continue
 
-        contract = tds[col_contract]
-        m = re.search(r"\bYR-(\d{2})\b", contract)
+        # Find contract cell by searching for YR-xx in the row
+        contract_idx = None
+        contract_text = None
+        for i, txt in enumerate(cells):
+            if re.search(r"\bYR-(\d{2})\b", txt):
+                contract_idx = i
+                contract_text = txt
+                break
+
+        if contract_idx is None or contract_text is None:
+            continue
+
+        m = re.search(r"\bYR-(\d{2})\b", contract_text)
         if not m:
             continue
 
         yy = int(m.group(1))
         delivery_year = 2000 + yy
 
-        d_val = _safe_float(tds[col_d])
+        # Ensure D column exists in this row
+        if col_d >= len(cells):
+            continue
+
+        d_val = _safe_float(cells[col_d])
         if d_val is None:
             continue
 
@@ -273,7 +290,8 @@ def fetch_omip_year_reference_prices(
 
     if not out:
         raise RuntimeError(
-            f"No Year reference prices found for {market.zone}/{market.instrument} on {asof_iso_date}."
+            f"No usable Year reference prices parsed for {market.zone}/{market.instrument} on {asof_iso_date}. "
+            f"(Found table with {best_cnt} YR rows, but could not extract D values.)"
         )
 
     return out
