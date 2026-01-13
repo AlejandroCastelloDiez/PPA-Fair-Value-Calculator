@@ -25,6 +25,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib import font_manager as fm
 
+# NEW (for logo)
+import matplotlib.image as mpimg
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+
 try:
     from zoneinfo import ZoneInfo  # py>=3.9
 except Exception:  # pragma: no cover
@@ -56,6 +60,9 @@ USER_AGENT = (
 )
 
 OMIP_URL = "https://www.omip.pt/es/dados-mercado"  # params: date, instrument, product, zone
+
+# NEW: logo in repo root
+LOGO_PATH = REPO_ROOT / "full-logo-negative.png"
 
 
 # =========================
@@ -463,6 +470,35 @@ def store_to_timeseries_df(store: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
+# NEW: helper to place logo bottom-left inside axes
+def _add_logo_bottom_left(ax, logo_path: Path, *, zoom: float = 0.08, pad_axes: Tuple[float, float] = (0.02, 0.06)) -> None:
+    """
+    Adds a small logo inside the plot area at bottom-left.
+    - zoom controls logo size (smaller -> smaller logo)
+    - pad_axes is (x,y) in axes fraction coordinates
+    """
+    try:
+        if not logo_path.exists():
+            return  # silently skip if missing
+        img = mpimg.imread(str(logo_path))
+
+        oi = OffsetImage(img, zoom=zoom)
+        oi.set_alpha(1.0)
+
+        ab = AnnotationBbox(
+            oi,
+            (pad_axes[0], pad_axes[1]),
+            xycoords="axes fraction",
+            frameon=False,
+            box_alignment=(0, 0),  # anchor bottom-left of logo to the point
+            zorder=10,
+        )
+        ax.add_artist(ab)
+    except Exception:
+        # Never break plotting because of the logo
+        return
+
+
 def plot_zone(df: pd.DataFrame, zone_prefix: str, out_path: Path, title: str) -> None:
     """
     zone_prefix: "ES" or "PT"
@@ -487,6 +523,9 @@ def plot_zone(df: pd.DataFrame, zone_prefix: str, out_path: Path, title: str) ->
     ax.set_ylabel("€/MWh")
     ax.grid(False)
     ax.legend()
+
+    # NEW: add logo inside the chart (bottom-left)
+    _add_logo_bottom_left(ax, LOGO_PATH, zoom=0.08, pad_axes=(0.02, 0.06))
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -517,6 +556,9 @@ def plot_basis(df: pd.DataFrame, out_path: Path) -> None:
     ax.set_ylabel("€/MWh")
     ax.grid(False)
     ax.legend()
+
+    # NEW: add logo inside the chart (bottom-left)
+    _add_logo_bottom_left(ax, LOGO_PATH, zoom=0.08, pad_axes=(0.02, 0.06))
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -552,4 +594,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
