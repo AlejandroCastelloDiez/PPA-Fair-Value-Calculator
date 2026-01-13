@@ -471,7 +471,7 @@ def store_to_timeseries_df(store: Dict[str, Any]) -> pd.DataFrame:
 
 
 # NEW: helper to place logo bottom-left inside axes
-def _add_logo_bottom_left(ax, logo_path: Path, *, zoom: float = 0.08, pad_axes: Tuple[float, float] = (0.02, 0.06)) -> None:
+def _add_logo_bottom_left(ax, logo_path: Path, *, zoom: float = 0.2, pad_axes: Tuple[float, float] = (0.02, 0.06)) -> None:
     """
     Adds a small logo inside the plot area at bottom-left.
     - zoom controls logo size (smaller -> smaller logo)
