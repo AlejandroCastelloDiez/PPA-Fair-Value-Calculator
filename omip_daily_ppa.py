@@ -525,7 +525,7 @@ def plot_zone(df: pd.DataFrame, zone_prefix: str, out_path: Path, title: str) ->
     ax.legend()
 
     # NEW: add logo inside the chart (bottom-left)
-    _add_logo_bottom_left(ax, LOGO_PATH, zoom=0.2, pad_axes=(0.02, 0.06))
+    _add_logo_bottom_left(ax, LOGO_PATH, zoom=0.15, pad_axes=(0.02, 0.06))
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -558,7 +558,7 @@ def plot_basis(df: pd.DataFrame, out_path: Path) -> None:
     ax.legend()
 
     # NEW: add logo inside the chart (bottom-left)
-    _add_logo_bottom_left(ax, LOGO_PATH, zoom=0.08, pad_axes=(0.02, 0.06))
+    _add_logo_bottom_left(ax, LOGO_PATH, zoom=0.15, pad_axes=(0.02, 0.06))
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
