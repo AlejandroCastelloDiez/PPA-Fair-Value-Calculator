@@ -115,7 +115,6 @@ def iso_to_yyyymmdd(iso: str) -> str:
 
 def get_yesterday_yyyymmdd(tz_name: str = TIMEZONE) -> str:
     if ZoneInfo is None:
-        # fallback: naive local time (still fine for GitHub runner most days)
         d = (datetime.now() - timedelta(days=1)).date()
     else:
         now_tz = datetime.now(ZoneInfo(tz_name))
@@ -133,7 +132,6 @@ def _safe_float(x: str) -> Optional[float]:
     s = (x or "").strip()
     if not s or s.lower() in {"n.a.", "na", "n/a", "-"}:
         return None
-    # OMIP uses dot decimals; keep robust to commas anyway
     s = s.replace(",", ".")
     try:
         return float(s)
@@ -150,15 +148,12 @@ def fetch_omip_year_reference_prices(
     session: Optional[requests.Session] = None,
 ) -> Dict[int, float]:
     """
-    Returns mapping delivery_year -> D reference price (€/MWh) for Year contracts
-    (e.g., YR-27 -> 2027) for the given market and date.
+    Returns mapping delivery_year -> reference price (€/MWh) for Year contracts.
 
-    Robust strategy:
-      - Pick the table that actually contains YR-xx rows
-      - Use the first THEAD row "group headers" + colspans to locate the
-        'Reference prices' group column range
-      - Use the first column inside 'Reference prices' group as 'D' (not D-1, etc.)
-      - Find contract name by locating the cell that contains YR-xx in each row
+    Fallback logic requested:
+      - Try D column
+      - If missing/NA, try D-1 column
+      - If still nothing usable overall, raise (caller will copy yesterday from JSON)
     """
     sess = session or requests.Session()
     params = {
@@ -176,9 +171,7 @@ def fetch_omip_year_reference_prices(
     if not tables:
         raise RuntimeError("No tables found in OMIP HTML.")
 
-    # -----------------------------
     # 1) Choose the table that contains YR-xx rows
-    # -----------------------------
     def year_row_count(tbl) -> int:
         cnt = 0
         for tr in tbl.find_all("tr"):
@@ -196,9 +189,7 @@ def fetch_omip_year_reference_prices(
             "OMIP may not have published data for that date."
         )
 
-    # -----------------------------
     # 2) Locate the 'Reference prices' group range using THEAD colspans
-    # -----------------------------
     thead = target.find("thead")
     if not thead:
         raise RuntimeError("OMIP table has no <thead>; cannot locate Reference prices group.")
@@ -207,13 +198,11 @@ def fetch_omip_year_reference_prices(
     if not head_rows:
         raise RuntimeError("OMIP table <thead> has no rows.")
 
-    # The group header row is usually the FIRST header row
     group_row = head_rows[0]
     group_ths = group_row.find_all("th")
     if not group_ths:
         raise RuntimeError("OMIP table group header row has no <th> cells.")
 
-    # Build group segments with start/end indices based on colspan
     segments = []
     col_idx = 0
     for th in group_ths:
@@ -228,7 +217,6 @@ def fetch_omip_year_reference_prices(
         segments.append((label, start, end))
         col_idx += span
 
-    # Find the segment that corresponds to "Reference prices"
     ref_seg = None
     for label, start, end in segments:
         if re.search(r"Reference\s*prices", label, flags=re.IGNORECASE):
@@ -236,7 +224,6 @@ def fetch_omip_year_reference_prices(
             break
 
     if ref_seg is None:
-        # Sometimes translated; try Spanish/Portuguese variants
         for label, start, end in segments:
             if re.search(r"Precios\s+de\s+referencia", label, flags=re.IGNORECASE) or re.search(
                 r"Preços\s+de\s+referência", label, flags=re.IGNORECASE
@@ -253,10 +240,9 @@ def fetch_omip_year_reference_prices(
 
     # Convention on OMIP layout: first column within "Reference prices" group = D
     col_d = ref_start
+    col_d_minus_1 = col_d - 1  # requested fallback
 
-    # -----------------------------
     # 3) Parse rows
-    # -----------------------------
     out: Dict[int, float] = {}
     tbody = target.find("tbody") or target
     rows = tbody.find_all("tr")
@@ -267,15 +253,12 @@ def fetch_omip_year_reference_prices(
             continue
 
         # Find contract cell by searching for YR-xx in the row
-        contract_idx = None
         contract_text = None
-        for i, txt in enumerate(cells):
+        for txt in cells:
             if re.search(r"\bYR-(\d{2})\b", txt):
-                contract_idx = i
                 contract_text = txt
                 break
-
-        if contract_idx is None or contract_text is None:
+        if contract_text is None:
             continue
 
         m = re.search(r"\bYR-(\d{2})\b", contract_text)
@@ -285,11 +268,15 @@ def fetch_omip_year_reference_prices(
         yy = int(m.group(1))
         delivery_year = 2000 + yy
 
-        # Ensure D column exists in this row
-        if col_d >= len(cells):
-            continue
+        # Try D, then D-1
+        d_val: Optional[float] = None
 
-        d_val = _safe_float(cells[col_d])
+        if 0 <= col_d < len(cells):
+            d_val = _safe_float(cells[col_d])
+
+        if d_val is None and 0 <= col_d_minus_1 < len(cells):
+            d_val = _safe_float(cells[col_d_minus_1])
+
         if d_val is None:
             continue
 
@@ -298,7 +285,7 @@ def fetch_omip_year_reference_prices(
     if not out:
         raise RuntimeError(
             f"No usable Year reference prices parsed for {market.zone}/{market.instrument} on {asof_iso_date}. "
-            f"(Found table with {best_cnt} YR rows, but could not extract D values.)"
+            f"(Found table with {best_cnt} YR rows, but could not extract D nor D-1 values.)"
         )
 
     return out
@@ -318,15 +305,10 @@ def ppa_fv_from_year_forwards(
     """
     Converts yearly forward prices into a single fixed PPA price for a flat 1 MW baseload,
     using mid-year discounting and hour weighting.
-
-    Start year = asof.year + 1
-    Term covers start_year ... start_year+tenor_years-1
-    Discount time uses mid-year: (year - asof_year) - 0.5
     """
     start_year = asof.year + 1
     years = list(range(start_year, start_year + tenor_years))
 
-    # PV(price * hours) / PV(hours) => levelized fixed price
     pv_num = 0.0
     pv_den = 0.0
 
@@ -337,8 +319,6 @@ def ppa_fv_from_year_forwards(
         price = float(year_forwards[y])
         h = float(hours_in_year(y, use_leap_hours=use_leap_hours))
 
-        # Mid-year timing relative to asof year:
-        # e.g. asof 2026 -> year 2027 mid-year is ~1.5 years away
         t = (y - asof.year) - 0.5
         df = 1.0 / ((1.0 + discount_rate) ** t) if discount_rate != 0 else 1.0
 
@@ -358,7 +338,6 @@ def load_store(path: Path) -> Dict[str, Any]:
         if not isinstance(obj, dict):
             raise ValueError("JSON store must be an object.")
         if "data" not in obj or not isinstance(obj["data"], dict):
-            # normalize
             obj["data"] = {}
         if "meta" not in obj or not isinstance(obj["meta"], dict):
             obj["meta"] = {}
@@ -377,6 +356,25 @@ def save_store(path: Path, obj: Dict[str, Any], pretty: bool = True) -> None:
     tmp.replace(path)
 
 
+def _copy_previous_entry_or_fail(store: Dict[str, Any], iso_today: str, iso_yesterday: str) -> Dict[str, Any]:
+    """
+    Copies yesterday's stored PPA entry into today's date.
+    """
+    data = store.get("data", {})
+    if not isinstance(data, dict):
+        raise ValueError("store['data'] must be a dict.")
+
+    if iso_yesterday not in data:
+        raise RuntimeError(
+            f"OMIP data missing for {iso_today}, and cannot copy fallback because JSON has no entry for {iso_yesterday}."
+        )
+
+    # Shallow copy is fine (values are primitives), but keep it explicit.
+    store["data"][iso_today] = json.loads(json.dumps(data[iso_yesterday]))
+    save_store(PPA_JSON_PATH, store, pretty=True)
+    return store
+
+
 def update_store_for_date(
     yyyymmdd: str,
     *,
@@ -386,14 +384,16 @@ def update_store_for_date(
 ) -> Dict[str, Any]:
     """
     Fetch OMIP data for the given date and append PPA FV values to store if date not present.
-    Returns the updated store object.
+    Fallback requested:
+      - If OMIP D is missing, try D-1 (handled in scraper).
+      - If still no usable OMIP info, copy yesterday's JSON entry into this date.
     """
     iso = yyyymmdd_to_iso(yyyymmdd)
     asof_dt = datetime.strptime(iso, "%Y-%m-%d").date()
+    iso_prev = (asof_dt - timedelta(days=1)).isoformat()
 
     store = load_store(PPA_JSON_PATH)
 
-    # meta refresh (keep prior fields if present)
     store["meta"].setdefault("format", "data[date] = {PPA_ES:{5Y,7Y,10Y}, PPA_PT:{5Y,7Y,10Y}}")
     store["meta"]["discount_rate"] = discount_rate
     store["meta"]["use_leap_hours"] = bool(use_leap_hours)
@@ -403,29 +403,44 @@ def update_store_for_date(
     if iso in store["data"]:
         return store
 
-    with requests.Session() as sess:
-        es_years = fetch_omip_year_reference_prices(iso, MARKETS["ES"], session=sess)
-        pt_years = fetch_omip_year_reference_prices(iso, MARKETS["PT"], session=sess)
+    try:
+        with requests.Session() as sess:
+            es_years = fetch_omip_year_reference_prices(iso, MARKETS["ES"], session=sess)
+            pt_years = fetch_omip_year_reference_prices(iso, MARKETS["PT"], session=sess)
 
-    entry: Dict[str, Any] = {"PPA_ES": {}, "PPA_PT": {}}
+        entry: Dict[str, Any] = {"PPA_ES": {}, "PPA_PT": {}}
 
-    for n in tenors:
-        entry["PPA_ES"][f"{n}Y"] = round(
-            ppa_fv_from_year_forwards(
-                asof_dt, es_years, n, discount_rate=discount_rate, use_leap_hours=use_leap_hours
-            ),
-            2,
+        for n in tenors:
+            entry["PPA_ES"][f"{n}Y"] = round(
+                ppa_fv_from_year_forwards(
+                    asof_dt, es_years, n, discount_rate=discount_rate, use_leap_hours=use_leap_hours
+                ),
+                2,
+            )
+            entry["PPA_PT"][f"{n}Y"] = round(
+                ppa_fv_from_year_forwards(
+                    asof_dt, pt_years, n, discount_rate=discount_rate, use_leap_hours=use_leap_hours
+                ),
+                2,
+            )
+
+        store["data"][iso] = entry
+        save_store(PPA_JSON_PATH, store, pretty=True)
+        return store
+
+    except Exception as e:
+        # If OMIP didn't publish or parsing failed even with D-1 fallback:
+        # copy yesterday's already-stored results into this date.
+        print(
+            f"[WARN] OMIP data unavailable/unusable for {iso} ({market_hint(MARKETS)}). "
+            f"Copying {iso_prev} values into {iso}. Reason: {type(e).__name__}: {e}"
         )
-        entry["PPA_PT"][f"{n}Y"] = round(
-            ppa_fv_from_year_forwards(
-                asof_dt, pt_years, n, discount_rate=discount_rate, use_leap_hours=use_leap_hours
-            ),
-            2,
-        )
+        return _copy_previous_entry_or_fail(store, iso, iso_prev)
 
-    store["data"][iso] = entry
-    save_store(PPA_JSON_PATH, store, pretty=True)
-    return store
+
+def market_hint(markets: Dict[str, MarketSpec]) -> str:
+    # just for log readability
+    return ",".join([f"{k}:{v.instrument}/{v.zone}" for k, v in markets.items()])
 
 
 # =========================
@@ -435,10 +450,6 @@ LINE_COLORS = {"10Y": "#69DECE", "7Y": "#219B93", "5Y": "#1C1C1C"}  # only used 
 
 
 def store_to_timeseries_df(store: Dict[str, Any]) -> pd.DataFrame:
-    """
-    Returns DataFrame indexed by date with columns:
-    ES_5Y, ES_7Y, ES_10Y, PT_5Y, PT_7Y, PT_10Y
-    """
     rows = []
     data = store.get("data", {})
     if not isinstance(data, dict):
@@ -470,16 +481,16 @@ def store_to_timeseries_df(store: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
-# NEW: helper to place logo bottom-left inside axes
-def _add_logo_bottom_left(ax, logo_path: Path, *, zoom: float = 0.08, pad_axes: Tuple[float, float] = (0.02, 0.06)) -> None:
-    """
-    Adds a small logo inside the plot area at bottom-left.
-    - zoom controls logo size (smaller -> smaller logo)
-    - pad_axes is (x,y) in axes fraction coordinates
-    """
+def _add_logo_bottom_left(
+    ax,
+    logo_path: Path,
+    *,
+    zoom: float = 0.08,
+    pad_axes: Tuple[float, float] = (0.02, 0.06),
+) -> None:
     try:
         if not logo_path.exists():
-            return  # silently skip if missing
+            return
         img = mpimg.imread(str(logo_path))
 
         oi = OffsetImage(img, zoom=zoom)
@@ -490,19 +501,15 @@ def _add_logo_bottom_left(ax, logo_path: Path, *, zoom: float = 0.08, pad_axes: 
             (pad_axes[0], pad_axes[1]),
             xycoords="axes fraction",
             frameon=False,
-            box_alignment=(0, 0),  # anchor bottom-left of logo to the point
+            box_alignment=(0, 0),
             zorder=10,
         )
         ax.add_artist(ab)
     except Exception:
-        # Never break plotting because of the logo
         return
 
 
 def plot_zone(df: pd.DataFrame, zone_prefix: str, out_path: Path, title: str) -> None:
-    """
-    zone_prefix: "ES" or "PT"
-    """
     _set_roboto_font()
 
     cols = [f"{zone_prefix}_5Y", f"{zone_prefix}_7Y", f"{zone_prefix}_10Y"]
@@ -524,7 +531,6 @@ def plot_zone(df: pd.DataFrame, zone_prefix: str, out_path: Path, title: str) ->
     ax.grid(False)
     ax.legend()
 
-    # NEW: add logo inside the chart (bottom-left)
     _add_logo_bottom_left(ax, LOGO_PATH, zoom=0.15, pad_axes=(0.02, 0.06))
 
     fig.tight_layout()
@@ -557,7 +563,6 @@ def plot_basis(df: pd.DataFrame, out_path: Path) -> None:
     ax.grid(False)
     ax.legend()
 
-    # NEW: add logo inside the chart (bottom-left)
     _add_logo_bottom_left(ax, LOGO_PATH, zoom=0.15, pad_axes=(0.02, 0.06))
 
     fig.tight_layout()
