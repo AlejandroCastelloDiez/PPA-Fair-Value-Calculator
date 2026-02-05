@@ -6,7 +6,7 @@
     "use_leap_hours": true,
     "note": "PPA FV computed from OMIP yearly forwards; mid-year discounting; tail extrapolation for missing last point.",
     "format": "data[date] = {PPA_ES:{5Y,7Y,10Y}, PPA_PT:{5Y,7Y,10Y}}",
-    "updated_at": "2026-02-04T06:08:57Z"
+    "updated_at": "2026-02-05T06:32:37Z"
   },
   "data": {
     "2025-01-01": {
@@ -4735,6 +4735,18 @@
         "5Y": 55.2,
         "7Y": 55.13,
         "10Y": 55.04
+      }
+    },
+    "2026-02-04": {
+      "PPA_ES": {
+        "5Y": 53.41,
+        "7Y": 53.44,
+        "10Y": 53.5
+      },
+      "PPA_PT": {
+        "5Y": 54.52,
+        "7Y": 54.56,
+        "10Y": 54.62
       }
     }
   }
